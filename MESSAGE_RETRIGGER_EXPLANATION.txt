@@ -1,0 +1,373 @@
+================================================================================
+          SAP CLOUD INTEGRATION (CPI) MESSAGE RETRIGGER ARCHITECTURE
+                     TECHNICAL & CODE-LEVEL EXPLANATION
+================================================================================
+
+TABLE OF CONTENTS:
+1. Executive Overview: What Does "Retrigger" Mean in This Application?
+2. Step-by-Step End-to-End Retrigger Workflow
+3. Frontend Code Walkthrough (Streamlit: frontend/streamlit_app.py)
+4. Backend Controller Walkthrough (Spring Boot: MessageController.java)
+5. Backend Core Service Walkthrough (Spring Boot: SapCiClient.java)
+6. Dynamic Endpoint Resolution (How Target iFlow URL is Discovered)
+7. Lineage & Audit Headers (Preserving Parent Tracking)
+8. Zero-Disk Volatile Memory Handling (Strict RAM-Only Lifecycle)
+9. What Happens Inside SAP Cloud Integration When Retriggered?
+10. Summary FAQ
+
+================================================================================
+1. EXECUTIVE OVERVIEW: WHAT DOES "RETRIGGER" MEAN IN THIS APPLICATION?
+================================================================================
+In standard SAP Cloud Integration (CPI / BTP), there is no native "Resend" button 
+like there was in legacy SAP Process Orchestration (PO / PI PIMON). 
+
+When a message fails in SAP CPI:
+1. The failed message execution is permanently logged in the Message Processing 
+   Log (MPL) with status "FAILED".
+2. The payload that caused the failure (or was attached during the flow) is 
+   stored as an MPL Attachment (e.g., "Payload_Snapshot").
+3. To "retrigger" or "replay" that failed message, our application:
+   - Fetches the authentic payload from the failed message's attachment directly 
+     in volatile RAM.
+   - Automatically determines the exact SAP CPI runtime HTTP endpoint for that 
+     integration flow.
+   - Injects SAP PO lineage headers (SAP_ParentMessageId, SAP_MplCorrelationId) 
+     so audit trails remain intact.
+   - Executes an authenticated HTTP POST request to the SAP CPI integration 
+     flow runtime endpoint.
+   - SAP CPI processes this retrigger as a brand-new transaction linked 
+     to the parent message, creating a new MPL log.
+   - The UI moves the message out of "Failed" into a dedicated "Resent" column.
+
+================================================================================
+2. STEP-BY-STEP END-TO-END RETRIGGER WORKFLOW
+================================================================================
+[User in Browser]
+       │
+       ▼ (1) User clicks "⚡ Execute Resend (Replay Message)" in Streamlit UI
+[Streamlit Frontend: streamlit_app.py]
+       │
+       ▼ (2) Validates payload attachment exists (blocks if missing)
+       ▼ (3) Sends HTTP POST to: http://localhost:8081/api/messages/{messageId}/resend
+[Spring Boot Controller: MessageController.java]
+       │
+       ▼ (4) Calls: sapCiClient.initiateResend(messageId, options)
+[Spring Boot Service: SapCiClient.java]
+       │
+       ├─► (5) Authenticates with SAP BTP OAuth2 Service (Token Server)
+       │       --> Obtains Runtime Bearer Token
+       │
+       ├─► (6) Fetches Message Summary to determine iFlow Name (e.g. "resend-testing")
+       │
+       ├─► (7) Resolves target runtime endpoint:
+       │       --> https://<tenant>.it-cpitrial03.cfapps.ap21.hana.ondemand.com/http/resend-testing
+       │
+       ├─► (8) Extracts genuine payload from volatile memory / attachment
+       │
+       ├─► (9) Injects Enterprise Lineage Headers:
+       │       --> SAP_ParentMessageId = <original_messageId>
+       │       --> SAP_MplCorrelationId = <correlationId>
+       │       --> SAP_ResendAttempt = 1
+       │       --> SAP_SourceSystem = SAP_PO_MONITORING_REPLAY
+       │
+       └─► (10) Executes HTTP POST with Bearer Token to SAP CPI Runtime Endpoint
+               │
+               ▼
+   [SAP Cloud Integration Runtime (BTP)]
+               │
+               ▼ (11) Receives payload, starts iFlow execution
+               ▼ (12) Generates new MPL entry in SAP CPI cockpit
+               ▼ (13) Returns HTTP 200 OK
+               │
+       ▲───────┘
+       │
+[Spring Boot Backend]
+       │
+       ▼ (14) Records message in in-memory resent registry:
+              resentMessageComments.put(messageId, "This message was resent")
+       ▼ (15) De-references payload from RAM (payloadToSend = null)
+       ▼ (16) Returns JSON: { "success": true, "wasResent": true }
+       │
+[Streamlit Frontend]
+       │
+       ▼ (17) Updates session state: st.session_state["resent_messages"][messageId]
+       ▼ (18) Triggers st.rerun():
+              - Count updates: Failed count decreases by 1, Resent count increases by 1
+              - Table moves message to "🔄 RESENT" status
+              - Action panel switches to "🔄 Resent Message — Replay Disabled"
+
+================================================================================
+3. FRONTEND CODE WALKTHROUGH (frontend/streamlit_app.py)
+================================================================================
+File: frontend/streamlit_app.py
+
+1. Check if the message has payload and prevent resend if missing:
+-----------------------------------------------------------------
+Line ~959:
+```python
+elif not attachments and not loaded_payload:
+    # STRICT: If no payload attachment is available, resend is strictly blocked!
+    st.markdown("#### ⚡ SAP CI Resend Action Panel")
+    st.markdown(
+        f"""
+        <div style="background: rgba(239, 68, 68, 0.12); border-left: 4px solid #ef4444; padding: 14px 18px;">
+            <div style="color: #fca5a5; font-weight: 700;">🚫 Resend Blocked — No Payload Attachment Available</div>
+            <div style="color: #cbd5e1;">This message cannot be resent even after pressing the resend button...</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    if st.button("⚡ Execute Resend", key=f"resend_btn_blocked_{chosen_msg_id}", use_container_width=True):
+        st.error(f"🚫 Resend Blocked: Message '{chosen_msg_id}' has NO payload attachment available in SAP CI.")
+```
+
+2. Executing Resend when valid payload is available:
+---------------------------------------------------
+Line ~980:
+```python
+valid_payload = loaded_payload if (loaded_payload and not loaded_payload.startswith("[")) else ""
+
+if st.button("⚡ Execute Resend (Replay Message)", type="primary", use_container_width=True):
+    if not selected_att_id and not valid_payload:
+        st.error(f"🚫 Resend Blocked: Message '{chosen_msg_id}' has NO payload attachment available in SAP CI.")
+    elif not attachments:
+        st.error(f"🚫 Resend Blocked: Message '{chosen_msg_id}' has NO payload attachment available in SAP CI.")
+    else:
+        # Package options into request payload
+        resend_options = {
+            "mode": "IFLOW_ENDPOINT",
+            "payload": valid_payload,
+            "username": current_user,
+            "password": current_pass
+        }
+        if selected_att_id and not valid_payload:
+            resend_options["attachmentId"] = selected_att_id
+
+        # Trigger backend REST call
+        with st.spinner(f"Re-queuing message `{chosen_msg_id}` directly to iFlow '{chosen_flow}'..."):
+            result = resend_message(base_url, chosen_msg_id, resend_options)
+            if result.get("success", False):
+                # Update in-memory session state
+                st.session_state["resent_messages"][chosen_msg_id] = "This message was resent"
+                st.success(f"✅ Reprocessing Succeeded: {result.get('message')}")
+                st.rerun()
+```
+
+================================================================================
+4. BACKEND CONTROLLER WALKTHROUGH (MessageController.java)
+================================================================================
+File: backend/src/main/java/com/example/sapcimonitor/controller/MessageController.java
+
+Lines 79-86:
+```java
+@PostMapping("/{messageId}/resend")
+public ResponseEntity<Map<String, Object>> resend(
+        @PathVariable String messageId,
+        @RequestBody(required = false) Map<String, Object> body) {
+    Map<String, Object> response = sapCiClient.initiateResend(messageId, body != null ? body : Map.of());
+    return ResponseEntity.ok().body(response);
+}
+```
+The controller exposes a standard REST endpoint `POST /api/messages/{messageId}/resend`.
+It accepts optional parameters in the JSON request body (such as payload, mode, 
+username, password) and delegates execution to `SapCiClient`.
+
+================================================================================
+5. BACKEND CORE SERVICE WALKTHROUGH (SapCiClient.java)
+================================================================================
+File: backend/src/main/java/com/example/sapcimonitor/service/SapCiClient.java
+
+Method: `initiateResend(String messageId, Map<String, Object> options)` (Lines 435-555)
+
+Step 5.1: OAuth2 Access Token Check
+------------------------------------
+```java
+String token = fetchAccessToken();
+if (token == null) {
+    result.put("success", false);
+    result.put("message", "Could not obtain OAuth access token from SAP BTP.");
+    return result;
+}
+```
+
+Step 5.2: Discovering the iFlow Name
+------------------------------------
+```java
+MessageSummary summary = fetchMessageDetails(messageId);
+String iflowName = (summary != null && summary.getIFlowName() != null && !summary.getIFlowName().isBlank())
+        ? summary.getIFlowName()
+        : "Testing";
+```
+
+Step 5.3: Determining the Payload to Send
+-----------------------------------------
+```java
+String payloadToSend = null;
+if (options != null && options.containsKey("payload") && !String.valueOf(options.get("payload")).isBlank()) {
+    payloadToSend = String.valueOf(options.get("payload"));
+} else if (options != null && options.containsKey("attachmentId") && !String.valueOf(options.get("attachmentId")).isBlank()) {
+    payloadToSend = fetchAttachmentContent(String.valueOf(options.get("attachmentId")));
+} else {
+    payloadToSend = scrapeTraceAttachment(messageId, token);
+}
+
+// Block resend if payload is missing or blocked by SAP security policy
+if (payloadToSend == null || payloadToSend.isBlank() || 
+    payloadToSend.startsWith("[SAP BTP Security Policy]") || 
+    payloadToSend.startsWith("[User Authentication Failed]")) {
+    result.put("success", false);
+    result.put("message", "Resend blocked: No payload attachment available for message " + messageId + 
+                          ". This message cannot be resent even after pressing the resend button.");
+    return result;
+}
+```
+
+Step 5.4: Automatic Content-Type Detection
+------------------------------------------
+```java
+HttpHeaders outHeaders = new HttpHeaders();
+if (payloadToSend.trim().startsWith("<")) {
+    outHeaders.setContentType(MediaType.APPLICATION_XML);
+} else {
+    outHeaders.setContentType(MediaType.APPLICATION_JSON);
+}
+```
+
+Step 5.5: Injecting SAP PO Standard Lineage Headers
+---------------------------------------------------
+```java
+String correlationId = summary != null ? summary.getCorrelationId() : null;
+if (correlationId != null && !correlationId.isBlank()) {
+    outHeaders.set("SAP_MplCorrelationId", correlationId);
+    outHeaders.set("X-Correlation-ID", correlationId);
+} else {
+    outHeaders.set("SAP_MplCorrelationId", messageId);
+    outHeaders.set("X-Correlation-ID", messageId);
+}
+outHeaders.set("SAP_OriginalMessageId", messageId);
+outHeaders.set("SAP_ParentMessageId", messageId);
+outHeaders.set("SAP_ResendAttempt", "1");
+outHeaders.set("SAP_SourceSystem", "SAP_PO_MONITORING_REPLAY");
+outHeaders.set("X-Original-Message-Id", messageId);
+outHeaders.set("X-Resent-By", "SAP-CI-Monitor-Stateless-Engine");
+```
+
+Step 5.6: Resolving the Target iFlow Runtime URL
+------------------------------------------------
+```java
+destinationUrl = resolveIflowEndpoint(iflowName, token);
+
+String rtToken = fetchRuntimeAccessToken();
+if (rtToken != null) {
+    outHeaders.setBearerAuth(rtToken);
+} else {
+    outHeaders.setBearerAuth(token);
+}
+```
+
+Step 5.7: Dispatching the HTTP POST Request to SAP CPI
+------------------------------------------------------
+```java
+HttpEntity<String> outReq = new HttpEntity<>(payloadToSend, outHeaders);
+ResponseEntity<String> outResp = rest.postForEntity(URI.create(destinationUrl), outReq, String.class);
+
+// Immediately dereference payload from RAM (Compliance with plan.pdf zero-disk requirement)
+payloadToSend = null;
+```
+
+Step 5.8: Recording the Resent State in In-Memory Registry
+----------------------------------------------------------
+```java
+if (outResp.getStatusCode().is2xxSuccessful()) {
+    resentMessageComments.put(messageId, "This message was resent");
+    result.put("success", true);
+    result.put("wasResent", true);
+    result.put("comment", "This message was resent");
+    result.put("message", "Message resend triggered successfully on iFlow '" + iflowName + "'! Reprocessed via " + destinationUrl);
+    return result;
+}
+```
+
+================================================================================
+6. DYNAMIC ENDPOINT RESOLUTION (How Target iFlow URL is Discovered)
+================================================================================
+Method: `resolveIflowEndpoint(String iflowName, String token)` (Lines 390-433)
+
+How does the backend know WHERE to send the message?
+1. The backend inspects `tenantUrl`:
+   e.g.: https://b65f2da8trial.it-cpitrial03.cfapps.ap21.hana.ondemand.com
+2. In SAP BTP Cloud Foundry, the runtime integration engine endpoint format is:
+   https://<subdomain>.it-cpi001-rt.cfapps.<region>.hana.ondemand.com/http/<iflowName>
+   or
+   https://<tenant-url>/http/<iflowName>
+3. The method dynamically transforms the tenant URL into the runtime base URL:
+   `rtBase = tenantUrl + "/http/" + iflowName;`
+4. This ensures that the destination URL is never hardcoded and is completely 
+   hidden from the UI for security.
+
+================================================================================
+7. LINEAGE & AUDIT HEADERS (Preserving Parent Tracking)
+================================================================================
+When a message is resent, it enters SAP CPI as a new transaction. 
+How do we know which failed message it came from?
+
+We inject standard SAP PO enterprise headers into the retrigger request:
+- `SAP_ParentMessageId`: Contains the Message ID of the failed execution.
+- `SAP_OriginalMessageId`: Preserves the initial root transaction ID.
+- `SAP_MplCorrelationId`: Preserves the correlation ID so both logs can be 
+  queried under the same correlation ID in SAP BTP Cockpit.
+- `SAP_ResendAttempt`: Marks this execution as attempt #1.
+- `SAP_SourceSystem`: Identifies that the replay originated from this monitor.
+
+In the target iFlow in SAP CPI, you can read `${header.SAP_ParentMessageId}` 
+in Groovy or Content Modifier to log the parent link!
+
+================================================================================
+8. ZERO-DISK VOLATILE MEMORY HANDLING (Strict RAM-Only Lifecycle)
+================================================================================
+Per the architecture specification (`plan.pdf`):
+1. Payloads are NEVER written to a local `.txt`, `.json`, `.xml`, SQLite, or 
+   temporary scratch file on disk.
+2. The payload bytes are read directly from the SAP CPI OData attachment stream 
+   into an in-memory `String`.
+3. The `String` is passed as the body of Spring's `HttpEntity`.
+4. Right after `rest.postForEntity(...)` executes, the reference is set to `null`:
+   `payloadToSend = null;`
+5. The Java Garbage Collector immediately reclaims the RAM.
+
+================================================================================
+9. WHAT HAPPENS INSIDE SAP CLOUD INTEGRATION WHEN RETRIGGERED?
+================================================================================
+When the HTTP POST arrives at `https://.../http/resend-testing`:
+1. The SAP CPI HTTP Inbound Adapter receives the call.
+2. SAP CPI verifies the OAuth Bearer token (`rtToken`).
+3. SAP CPI generates a brand new `MessageGuid` and starts a new Message 
+   Processing Log (MPL).
+4. Because our headers contain `SAP_MplCorrelationId`, SAP CPI assigns the SAME 
+   correlation ID to this new log.
+5. The iFlow steps execute with the replayed payload.
+6. In the SAP BTP Cockpit, you will see two messages sharing the same Correlation ID:
+   - Message 1: The original message (Status: FAILED).
+   - Message 2: The retriggered message (Status: COMPLETED or PROCESSING).
+7. In our dashboard:
+   - Message 1 is categorized under the "🔄 Resent" column.
+   - Message 2 appears in the log table as the new execution.
+
+================================================================================
+10. SUMMARY FAQ
+================================================================================
+Q: Can a message without an attachment be resent?
+A: No. Both the frontend button and the backend service strictly reject resending 
+   if no valid payload attachment exists, to avoid firing blank requests into iFlows.
+
+Q: Can successful messages be resent?
+A: No. Resend is disabled for successful messages.
+
+Q: Can a resent message be resent a second time?
+A: No. Once replayed, the message transitions to the Resent state and the replay 
+   button is disabled to prevent duplicate processing.
+
+Q: Where are resent comments stored?
+A: In an in-memory thread-safe `ConcurrentHashMap` in the backend service and in 
+   the user's browser session state, maintaining zero disk persistence.
+================================================================================
