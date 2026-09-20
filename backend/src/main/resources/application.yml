@@ -11,7 +11,6 @@ sapci:
   runtimeTokenUrl: https://b65f2da8trial.authentication.ap21.hana.ondemand.com/oauth/token
   runtimeClientId: sb-091f3e35-24a0-4d8e-93b6-8a8647e8fe4e!b140547|it-rt-b65f2da8trial!b196
   runtimeClientSecret: d5ffb1d8-b136-4153-b240-de35a163b270$jp7sKT-s8HVxx_RLvUAyBtUhadKQviMvim75aENKDZQ=
-  targetReceiverUrl: https://resend-testing.free.beeceptor.com
 
 logging:
   level:

@@ -103,7 +103,7 @@ java -jar target/sap-ci-monitor-0.0.1-SNAPSHOT.jar
 ### Option B: Run Frontend Dashboard (Streamlit)
 ```powershell
 # From project root:
-.\.venv\Scripts\streamlit.exe run frontend/streamlit_app.py --server.port 8501
+.\.venv\Scripts\python.exe -m streamlit run frontend/streamlit_app.py --server.port 8501
 ```
 *Frontend opens at `http://localhost:8501`.*
 

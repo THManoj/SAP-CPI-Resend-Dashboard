@@ -56,27 +56,38 @@ public class SapCiClientTest {
         headers.setBearerAuth(token);
         headers.setAccept(List.of(org.springframework.http.MediaType.APPLICATION_JSON));
         
-        String rtToken = sapCiClient.fetchRuntimeAccessToken();
-        org.springframework.http.HttpHeaders rtHeaders = new org.springframework.http.HttpHeaders();
-        rtHeaders.setBearerAuth(rtToken != null ? rtToken : token);
-        rtHeaders.setContentType(org.springframework.http.MediaType.APPLICATION_JSON);
-
-        String[] testUrls = {
-            "https://b65f2da8trial.it-cpitrial03-rt.cfapps.ap21.hana.ondemand.com/http/testresend",
-            "https://b65f2da8trial.it-cpitrial03-rt.cfapps.ap21.hana.ondemand.com/http/test/resend",
-            "https://b65f2da8trial.it-cpitrial03-rt.cfapps.ap21.hana.ondemand.com/http/Testing"
-        };
-        for (String url : testUrls) {
-            try {
-                org.springframework.http.ResponseEntity<String> resp = rest.postForEntity(
-                    java.net.URI.create(url),
-                    new org.springframework.http.HttpEntity<>("{\"test\":true,\"orderId\":\"ORD-777\"}", rtHeaders),
-                    String.class
-                );
-                System.out.println("POST SUCCESS for " + url + " -> Status: " + resp.getStatusCode() + ", Body: " + resp.getBody());
-            } catch (Exception e) {
-                System.out.println("POST Failed for " + url + " -> " + e.getMessage());
-            }
+        // Test querying /ServiceEndpoints?$expand=EntryPoints&$format=json from SAP CPI
+        try {
+            String seUrl = "https://b65f2da8trial.it-cpitrial03.cfapps.ap21.hana.ondemand.com/api/v1/ServiceEndpoints?$expand=EntryPoints&$format=json";
+            org.springframework.http.ResponseEntity<String> seResp = rest.exchange(
+                java.net.URI.create(seUrl),
+                org.springframework.http.HttpMethod.GET,
+                new org.springframework.http.HttpEntity<>(headers),
+                String.class
+            );
+            System.out.println("ServiceEndpoints with EntryPoints Response -> Status: " + seResp.getStatusCode() + ", Body: " + seResp.getBody());
+        } catch (Exception e) {
+            System.out.println("ServiceEndpoints with EntryPoints Failed -> " + e.getMessage());
         }
+
+        // Test calling resolveIflowEndpoint directly on SapCiClient
+        String testingUrl = sapCiClient.resolveIflowEndpoint("Testing", token);
+        System.out.println("Resolved endpoint for 'Testing': " + testingUrl);
+        assertNotNull(testingUrl, "Should resolve endpoint for 'Testing'");
+        assertTrue(testingUrl.contains("/http/test/resend"), "Should match deployed sender address /http/test/resend");
+
+        String resendTestingUrl = sapCiClient.resolveIflowEndpoint("resend-testing", token);
+        System.out.println("Resolved endpoint for 'resend-testing': " + resendTestingUrl);
+        assertNotNull(resendTestingUrl, "Should resolve endpoint for 'resend-testing'");
+        assertTrue(resendTestingUrl.contains("/http/test/resending"), "Should match deployed sender address /http/test/resending");
+
+        String cpiDashUrl = sapCiClient.resolveIflowEndpoint("CPI_Dashboard_testing", token);
+        System.out.println("Resolved endpoint for 'CPI_Dashboard_testing': " + cpiDashUrl);
+        assertNotNull(cpiDashUrl, "Should resolve endpoint for 'CPI_Dashboard_testing'");
+        assertTrue(cpiDashUrl.contains("/http/resending/testing"), "Should match deployed sender address /http/resending/testing");
+
+        String nonExistentUrl = sapCiClient.resolveIflowEndpoint("NonExistent_iFlow_12345", token);
+        System.out.println("Resolved endpoint for 'NonExistent_iFlow_12345': " + nonExistentUrl);
+        assertNull(nonExistentUrl, "Should return null for non-existent or undeployed flow");
     }
 }

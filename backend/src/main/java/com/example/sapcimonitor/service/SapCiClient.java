@@ -57,9 +57,6 @@ public class SapCiClient {
     @Value("${sapci.runtimeClientSecret:}")
     private String runtimeClientSecret;
 
-    @Value("${sapci.targetReceiverUrl:https://resend-testing.free.beeceptor.com}")
-    private String targetReceiverUrl;
-
     private String cachedToken = null;
     private Instant tokenExpiry = Instant.MIN;
 
@@ -377,59 +374,67 @@ public class SapCiClient {
     }
 
     public String resolveIflowEndpoint(String iflowName, String token) {
-        String rtBase = (runtimeUrl != null && !runtimeUrl.isBlank()) ? runtimeUrl : tenantUrl;
-        if (rtBase.endsWith("/")) rtBase = rtBase.substring(0, rtBase.length() - 1);
-
-        if (iflowName == null || iflowName.isBlank()) {
-            return rtBase + "/http/test/resending";
+        if (iflowName == null || iflowName.isBlank() || isNotConfigured()) {
+            return null;
         }
 
-        String normalized = iflowName.trim().toLowerCase();
-        if (normalized.equals("testing")) {
-            return rtBase + "/http/test/resend";
-        }
-        if (normalized.equals("resend-testing")) {
-            return rtBase + "/http/test/resending";
-        }
+        try {
+            String base = messageProcessingApi.endsWith("/")
+                    ? messageProcessingApi.substring(0, messageProcessingApi.length() - 1)
+                    : messageProcessingApi;
+            String rootApi = base.substring(0, base.lastIndexOf("/"));
+            String seUrl = rootApi + "/ServiceEndpoints?$expand=EntryPoints&$format=json";
 
-        // Dynamic lookup via ServiceEndpoints API
-        if (token != null && !isNotConfigured()) {
-            try {
-                String base = messageProcessingApi.substring(0, messageProcessingApi.lastIndexOf("/"));
-                String seUrl = base + "/ServiceEndpoints?$format=json";
+            HttpHeaders headers = new HttpHeaders();
+            headers.setBearerAuth(token != null ? token : fetchAccessToken());
+            headers.setAccept(List.of(MediaType.APPLICATION_JSON));
 
-                HttpHeaders headers = new HttpHeaders();
-                headers.setBearerAuth(token);
-                headers.setAccept(List.of(MediaType.APPLICATION_JSON));
+            ResponseEntity<String> resp = rest.exchange(URI.create(seUrl), HttpMethod.GET, new HttpEntity<>(headers), String.class);
+            if (resp.getStatusCode().is2xxSuccessful() && resp.getBody() != null) {
+                JsonNode root = mapper.readTree(resp.getBody());
+                JsonNode results = root.has("d") && root.get("d").has("results") ? root.get("d").get("results") : null;
+                if (results != null && results.isArray()) {
+                    String targetFlow = iflowName.trim();
+                    for (JsonNode ep : results) {
+                        String name = ep.has("Name") ? ep.get("Name").asText() : "";
+                        String id = ep.has("Id") ? ep.get("Id").asText() : "";
+                        String title = ep.has("Title") ? ep.get("Title").asText() : "";
 
-                ResponseEntity<String> resp = rest.exchange(URI.create(seUrl), HttpMethod.GET, new HttpEntity<>(headers), String.class);
-                if (resp.getStatusCode().is2xxSuccessful() && resp.getBody() != null) {
-                    JsonNode root = mapper.readTree(resp.getBody());
-                    JsonNode list = root.has("d") && root.get("d").has("results") ? root.get("d").get("results") : root;
-                    if (list.isArray()) {
-                        for (JsonNode ep : list) {
-                            String name = ep.has("Name") ? ep.get("Name").asText() : "";
-                            if (name.equalsIgnoreCase(iflowName)) {
-                                String id = ep.has("Id") ? ep.get("Id").asText() : "";
-                                int idx = id.indexOf("endpointAddress=");
-                                if (idx > 0) {
-                                    String addr = id.substring(idx + "endpointAddress=".length());
-                                    addr = addr.replaceAll("^/+", "");
-                                    if (!addr.startsWith("http/")) {
-                                        addr = "http/" + addr;
+                        boolean isMatch = name.equalsIgnoreCase(targetFlow)
+                                || id.toLowerCase().startsWith(targetFlow.toLowerCase() + "$")
+                                || title.equalsIgnoreCase(targetFlow);
+
+                        if (isMatch) {
+                            // Extract genuine URL from EntryPoints if present
+                            if (ep.has("EntryPoints") && ep.get("EntryPoints").has("results")) {
+                                JsonNode entryList = ep.get("EntryPoints").get("results");
+                                if (entryList.isArray() && entryList.size() > 0) {
+                                    for (JsonNode entry : entryList) {
+                                        if (entry.has("Url") && !entry.get("Url").asText().isBlank()) {
+                                            return entry.get("Url").asText().trim();
+                                        }
                                     }
-                                    return rtBase + "/" + addr;
+                                }
+                            }
+                            // Fallback: extract endpointAddress parameter from Id if EntryPoints URL is missing
+                            if (id.contains("$endpointAddress=")) {
+                                String addr = id.substring(id.indexOf("$endpointAddress=") + "$endpointAddress=".length());
+                                if (!addr.isBlank()) {
+                                    String rtBase = (runtimeUrl != null && !runtimeUrl.isBlank()) ? runtimeUrl : tenantUrl;
+                                    if (rtBase.endsWith("/")) rtBase = rtBase.substring(0, rtBase.length() - 1);
+                                    String path = addr.startsWith("/") ? addr : "/" + addr;
+                                    return rtBase + "/http" + path;
                                 }
                             }
                         }
                     }
                 }
-            } catch (Exception e) {
-                log.debug("ServiceEndpoints resolution error for {}: {}", iflowName, e.getMessage());
             }
+        } catch (Exception e) {
+            log.error("Error resolving live ServiceEndpoint from SAP CI for flow '{}': {}", iflowName, e.getMessage());
         }
 
-        return rtBase + "/http/" + iflowName;
+        return null;
     }
 
     public Map<String, Object> initiateResend(String messageId, Map<String, Object> options) {
@@ -452,8 +457,13 @@ public class SapCiClient {
         MessageSummary summary = fetchMessageDetails(messageId);
         String webLink = summary != null ? summary.getAlternateWebLink() : null;
         String iflowName = (summary != null && summary.getIFlowName() != null && !summary.getIFlowName().isBlank())
-                ? summary.getIFlowName()
-                : "Testing";
+                ? summary.getIFlowName().trim()
+                : null;
+        if (iflowName == null) {
+            result.put("success", false);
+            result.put("message", "Resend blocked: Cannot identify Integration Flow name for message " + messageId);
+            return result;
+        }
         result.put("alternateWebLink", webLink);
         result.put("iFlowName", iflowName);
 
@@ -498,7 +508,10 @@ public class SapCiClient {
             outHeaders.set("SAP_ResendAttempt", "1");
             outHeaders.set("SAP_SourceSystem", "SAP_PO_MONITORING_REPLAY");
             outHeaders.set("X-Original-Message-Id", messageId);
-            outHeaders.set("X-Resent-By", "SAP-CI-Monitor-Stateless-Engine");
+            String resentBy = (options != null && options.containsKey("username") && !String.valueOf(options.get("username")).isBlank())
+                    ? String.valueOf(options.get("username")).trim()
+                    : "SAP-CI-Monitor-Stateless-Engine";
+            outHeaders.set("X-Resent-By", resentBy);
 
             // Dynamically re-inject any custom or original headers passed in options
             if (options != null && options.containsKey("headers")) {
@@ -517,26 +530,19 @@ public class SapCiClient {
                 }
             }
 
-            if ("DIRECT_RECEIVER".equalsIgnoreCase(resendMode)) {
-                destinationUrl = (options != null && options.containsKey("targetUrl") && !String.valueOf(options.get("targetUrl")).isBlank())
-                        ? String.valueOf(options.get("targetUrl"))
-                        : targetReceiverUrl;
-            } else {
-                // Re-trigger the EXACT SAP CPI iFlow Endpoint corresponding to this message!
-                if (options != null && options.containsKey("iflowUrl") && !String.valueOf(options.get("iflowUrl")).isBlank()) {
-                    destinationUrl = String.valueOf(options.get("iflowUrl"));
-                } else if (options != null && options.containsKey("targetEndpoint") && !String.valueOf(options.get("targetEndpoint")).isBlank()) {
-                    destinationUrl = String.valueOf(options.get("targetEndpoint"));
-                } else {
-                    destinationUrl = resolveIflowEndpoint(iflowName, token);
-                }
+            // Re-trigger the Integration Flow directly via on-the-fly resolved ServiceEndpoint
+            destinationUrl = resolveIflowEndpoint(iflowName, token);
+            if (destinationUrl == null || destinationUrl.isBlank()) {
+                result.put("success", false);
+                result.put("message", "Resend blocked: No active deployed HTTP/HTTPS ServiceEndpoint found in SAP CI for Integration Flow '" + iflowName + "'. Please verify that the flow is deployed and configured with an HTTP sender adapter.");
+                return result;
+            }
 
-                String rtToken = fetchRuntimeAccessToken();
-                if (rtToken != null) {
-                    outHeaders.setBearerAuth(rtToken);
-                } else {
-                    outHeaders.setBearerAuth(token);
-                }
+            String rtToken = fetchRuntimeAccessToken();
+            if (rtToken != null) {
+                outHeaders.setBearerAuth(rtToken);
+            } else {
+                outHeaders.setBearerAuth(token);
             }
 
             HttpEntity<String> outReq = new HttpEntity<>(payloadToSend, outHeaders);
@@ -546,17 +552,14 @@ public class SapCiClient {
             payloadToSend = null;
 
             if (outResp.getStatusCode().is2xxSuccessful()) {
-                resentMessageComments.put(messageId, "This message was resent");
+                String commentText = "This message was resent by " + resentBy;
+                resentMessageComments.put(messageId, commentText);
                 result.put("success", true);
                 result.put("wasResent", true);
-                result.put("comment", "This message was resent");
+                result.put("comment", commentText);
                 result.put("statusCode", outResp.getStatusCode().value());
                 result.put("destination", destinationUrl);
-                if ("IFLOW_ENDPOINT".equalsIgnoreCase(resendMode)) {
-                    result.put("message", "Message resend triggered successfully on iFlow '" + iflowName + "'! Reprocessed via " + destinationUrl + ". A brand new execution log has been created under '" + iflowName + "' in SAP CI Monitoring.");
-                } else {
-                    result.put("message", "Message " + messageId + " payload delivered directly to " + destinationUrl + " (HTTP " + outResp.getStatusCode().value() + ").");
-                }
+                result.put("message", "Message resend triggered successfully on iFlow '" + iflowName + "'! Reprocessed via " + destinationUrl + ". A brand new execution log has been created under '" + iflowName + "' in SAP CI Monitoring.");
                 return result;
             } else {
                 result.put("success", false);
@@ -693,7 +696,7 @@ public class SapCiClient {
     public String resolvePackageForFlow(String flowName) {
         if (flowName == null || flowName.isBlank()) return "Standard Package";
         refreshPackageCacheIfNeeded();
-        return flowToPackageCache.getOrDefault(flowName, "CPI-Trail to resend messages");
+        return flowToPackageCache.getOrDefault(flowName, "Unpackaged Artifact");
     }
 
     private synchronized void refreshPackageCacheIfNeeded() {

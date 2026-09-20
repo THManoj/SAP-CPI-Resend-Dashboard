@@ -357,7 +357,7 @@ def render_login_screen(base_url: str) -> None:
             c_sys2.text_input("Client", value="100", disabled=True)
             c_sys3.text_input("Language", value="EN", disabled=True)
             
-            username = st.text_input("User (BTP Email)", value="thmanoj272@gmail.com")
+            username = st.text_input("User (BTP Email)", value=os.getenv("DEFAULT_BTP_USER", ""), placeholder="Enter BTP Email")
             password = st.text_input("Password", type="password", placeholder="Enter BTP Password")
             
             st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
@@ -383,7 +383,7 @@ def render_login_screen(base_url: str) -> None:
 # View 2: SAP PO Message Monitoring Dashboard
 # -------------------------------------------------------------
 def render_po_dashboard(base_url: str) -> None:
-    current_user = st.session_state.get("username", "thmanoj272@gmail.com")
+    current_user = st.session_state.get("username", "Authenticated User")
     current_pass = st.session_state.get("password", "")
 
     # Top SAP Enterprise Header
@@ -450,7 +450,7 @@ def render_po_dashboard(base_url: str) -> None:
     for m in messages:
         flow_name = m.get("iFlowName") or m.get("iflowName") or "Unknown"
         # Extract package dynamically from backend response or default
-        pkg_name = m.get("packageName") or "CPI-Trail to resend messages"
+        pkg_name = m.get("packageName") or "Unpackaged Artifact"
         if flow_name not in flow_map:
             flow_map[flow_name] = {
                 "iflow": flow_name,
@@ -716,7 +716,7 @@ def render_po_dashboard(base_url: str) -> None:
             for m in active_table_messages:
                 mid = m.get("messageId", "")
                 flow = m.get("iFlowName") or m.get("iflowName") or ""
-                pkg = m.get("packageName") or (flow_map.get(flow, {}).get("package") if flow in flow_map else "CPI-Trail to resend messages")
+                pkg = m.get("packageName") or (flow_map.get(flow, {}).get("package") if flow in flow_map else "Unpackaged Artifact")
                 st_val = _safe_text(m.get("status")).upper()
                 step = m.get("failedStep") or "End Message"
                 ts = _iso_to_local(m.get("timestamp"))
@@ -818,8 +818,8 @@ def render_po_dashboard(base_url: str) -> None:
                     attachments = fetch_attachments(base_url, chosen_msg_id)
 
                 chosen_status = _safe_text(details.get("status")).upper()
-                chosen_flow = details.get("iFlowName") or "resend-testing"
-                chosen_pkg = details.get("packageName") or (flow_map.get(chosen_flow, {}).get("package") if chosen_flow in flow_map else "CPI-Trail to resend messages")
+                chosen_flow = details.get("iFlowName") or ""
+                chosen_pkg = details.get("packageName") or (flow_map.get(chosen_flow, {}).get("package") if chosen_flow in flow_map else "Unpackaged Artifact")
 
                 # Check if this message was resent
                 is_chosen_resent = (

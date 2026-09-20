@@ -9,5 +9,5 @@ if exist ".venv\Scripts\activate.bat" (
     echo Virtual environment not found, using global python...
 )
 echo Launching Streamlit dashboard on http://localhost:8501 ...
-streamlit run frontend\streamlit_app.py --server.port 8501
+python -m streamlit run frontend\streamlit_app.py --server.port 8501
 pause
